@@ -32,6 +32,8 @@ import msgpack
 import msgpack_numpy as m
 import zmq
 import psutil
+import copy
+import threading
 
 
 class BanyanBase(object):
@@ -104,23 +106,23 @@ class BanyanBase(object):
             self.back_plane_ip_address = back_plane_ip_address
         else:
             # check for a running backplane
-            for pid in psutil.pids():
-                p = psutil.Process(pid)
-                try:
-                    p_command = p.cmdline()
-                except psutil.AccessDenied:
-                    # occurs in Windows - ignore
-                    continue
-                try:
-                    if any('backplane' in s for s in p_command):
-                        self.backplane_exists = True
-                    else:
-                        continue
-                except UnicodeDecodeError:
-                    continue
-
-            if not self.backplane_exists:
-                raise RuntimeError('Backplane is not running - please start it.')
+            # for pid in psutil.pids():
+            #     p = psutil.Process(pid)
+            #     try:
+            #         p_command = p.cmdline()
+            #     except psutil.AccessDenied:
+            #         # occurs in Windows - ignore
+            #         continue
+            #     try:
+            #         if any('backplane' in s for s in p_command):
+            #             self.backplane_exists = True
+            #         else:
+            #             continue
+            #     except UnicodeDecodeError:
+            #         continue
+            #
+            # if not self.backplane_exists:
+            #     raise RuntimeError('Backplane is not running - please start it.')
             # determine this computer's IP address
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             # use the google dns
@@ -194,7 +196,7 @@ class BanyanBase(object):
         pub_envelope = topic.encode()
         self.publisher.send_multipart([pub_envelope, message])
 
-    def receive_loop(self):
+    def receive_loop_bak(self):
         """
         This is the receive loop for Banyan messages.
 
@@ -204,7 +206,12 @@ class BanyanBase(object):
         """
         while True:
             try:
+                import os
+                # print('接收消息中。。。')
+                # print('parent process:', os.getppid())
+                # print('process id:', os.getpid())
                 data = self.subscriber.recv_multipart(zmq.NOBLOCK)
+                print('接收到消息：{}'.format(data[1].decode('utf-8', 'ignore')))
                 if self.numpy:
                     payload2 = {}
                     payload = msgpack.unpackb(data[1], object_hook=m.decode)
@@ -223,6 +230,56 @@ class BanyanBase(object):
                                                      msgpack.unpackb(data[1], raw=False))
             # if no messages are available, zmq throws this exception
             except zmq.error.Again:
+                # print('未能接收到消息')
+                try:
+                    if self.receive_loop_idle_addition:
+                        self.receive_loop_idle_addition()
+                    time.sleep(self.loop_time)
+                except KeyboardInterrupt:
+                    self.clean_up()
+                    raise KeyboardInterrupt
+
+    def receive_loop(self):
+        '''
+        重写该方法，实现了每个任务一个线程的功能
+        '''
+        print('Thread id : %d' % threading.currentThread().ident)
+        tasks = {}
+
+        def do_task(tasks, key):
+            for com in tasks[key]:
+                print('执行 {} 的 {} 命令'.format(key, com))
+                self.incoming_message_processing('to_nl_gateway', com)
+
+        while True:
+            try:
+                import os
+                data = self.subscriber.recv_multipart(zmq.NOBLOCK)
+                # data.append('task01')
+                print('接收到消息：{}'.format(data))
+                # task_name = data[2]
+                command = msgpack.unpackb(data[1], raw=False)
+                task_name = command.get('uuid')
+                del command['uuid']
+                if task_name not in tasks:
+                    commands = []
+                    commands.append(command)
+                    tasks[task_name] = commands
+                else:
+                    tasks[task_name].append(command)
+            except zmq.error.Again:
+                if len(tasks) != 0:
+                    print("添加任务")
+                    li = []
+                    for key in tasks.keys():
+                        print('启动线程执行任务')
+                        thread_ = threading.Thread(target=do_task, args=(copy.deepcopy(tasks), key), daemon=True)
+                        li.append(thread_)
+                        thread_.start()
+                    for t in li:
+                        t.join()
+                    print('清空tasks')
+                    tasks.clear()
                 try:
                     if self.receive_loop_idle_addition:
                         self.receive_loop_idle_addition()
@@ -232,6 +289,7 @@ class BanyanBase(object):
                     raise KeyboardInterrupt
 
     def incoming_message_processing(self, topic, payload):
+        print('incoming_message_processing Thread id : %d' % threading.currentThread().ident)
         """
         Override this method with a custom Banyan message processor for subscribed messages.
 
